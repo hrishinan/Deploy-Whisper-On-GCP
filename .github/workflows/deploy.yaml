@@ -94,9 +94,9 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/kokila-v0/github:latest .
+          docker build -t asia-southeast1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/kokila-v0/github:latest .
           # docker build -t asia-southeast1-docker.pkg.dev/stage-agni/kokila-v0:latest -f Dockerfile .
                     
       - name: Push Docker image
         run: |
-          docker push us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/kokila-v0/github:latest
+          docker push asia-southeast1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/kokila-v0/github:latest
