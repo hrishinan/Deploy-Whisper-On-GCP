@@ -77,7 +77,27 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        
+      - name: Google Auth
+        id: auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          install_components: beta
+      
+      - name: Who am I?
+        run: |
+          service_account=$(gcloud config get-value account)
+          echo "Active Service Account: $service_account"
+
+      - name: Authenticate Docker with Google Container Registry
+        run: gcloud auth configure-docker
 
       - name: Build Docker image
         run: |
-          docker build -t my-app:latest -f Dockerfile .
+          docker build -t asia-southeast1-docker.pkg.dev/stage-agni/kokila-v0:latest -f Dockerfile .
