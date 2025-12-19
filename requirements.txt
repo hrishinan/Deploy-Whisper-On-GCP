@@ -4,3 +4,4 @@ uvicorn
 openai-whisper
 torch
 numpy<2
+tiktoken==0.6.0
