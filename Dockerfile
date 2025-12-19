@@ -4,23 +4,22 @@ FROM pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime
 
 # Set the working directory in the container
 WORKDIR /app
-# Install system deps INCLUDING Rust (key fix)
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    rustc \
-    cargo \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# # Install system deps INCLUDING Rust (key fix)
+# RUN apt-get update && apt-get install -y \
+#     build-essential \
+#     rustc \
+#     cargo \
+#     ffmpeg \
+#     && rm -rf /var/lib/apt/lists/*
 
-# Verify Rust (important)
-RUN rustc --version && cargo --version
+# # Verify Rust (important)
+# RUN rustc --version && cargo --version
 
 # Copy the requirements file into the container
 COPY requirements.txt .
 
 # Install the required packages
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir models
 
