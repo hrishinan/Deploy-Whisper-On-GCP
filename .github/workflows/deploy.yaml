@@ -59,7 +59,7 @@
 #             --gpu-type nvidia-l4 \
 #             --max-instances 1 \
 #             --quiet
-name: Build Docker Image
+name: Build Docker Image on Cloud Run
 
 on:
   push:
