@@ -1,206 +1,202 @@
-import whisper
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-import subprocess
-import tempfile
-import shutil
 import os
-import torch
 import time
 import json
+import tempfile
 from datetime import datetime
 
+import numpy as np
+import soundfile as sf
+import torch
+import whisper
+
+from fastapi import FastAPI, Request
 from google.cloud import storage
+
+# ================================
+# NEW: VAD imports (RunPod parity)
+# ================================
+from silero_vad import load_silero_vad, get_speech_timestamps
+
 
 # =====================================================
 # CONFIG
 # =====================================================
 MODEL_VERSION = "large-v3-turbo"
 NUM_MELS = 128
+CHUNK_SEC = 60  # RunPod uses ~60s chunks
 
-GCS_OUTPUT_BUCKET = os.environ.get("GCS_OUTPUT_BUCKET")
+GCS_INPUT_BUCKET = os.environ["GCS_INPUT_BUCKET"]
+GCS_OUTPUT_BUCKET = os.environ["GCS_OUTPUT_BUCKET"]
 GCS_OUTPUT_PREFIX = os.environ.get("GCS_OUTPUT_PREFIX", "whisper-results")
 
-if not GCS_OUTPUT_BUCKET:
-    raise RuntimeError("GCS_OUTPUT_BUCKET env var is required")
-
 # =====================================================
-# APP + MODEL
+# APP + MODELS
 # =====================================================
 app = FastAPI()
 
 MODEL_PATH = f"/app/models/{MODEL_VERSION}.pt"
 MODEL = whisper.load_model(MODEL_PATH)
 
+# ================================
+# NEW: Load VAD once (global)
+# ================================
+VAD_MODEL = load_silero_vad()
+
 gcs_client = storage.Client()
 
+
 # =====================================================
-# HELPERS
+# LOGGING
 # =====================================================
 def log(msg: str):
     print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
 
-def save_upload_file_to_temp(upload_file: UploadFile) -> str:
-    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        upload_file.file.seek(0)
-        shutil.copyfileobj(upload_file.file, temp_file)
-        return temp_file.name
+# =====================================================
+# NEW: VAD + CHUNKING HELPERS
+# =====================================================
+def apply_vad(audio: np.ndarray, sr: int) -> np.ndarray:
+    """
+    Removes silence using Silero VAD.
+    Matches RunPod: 'VAD filter removed XX sec'
+    """
+    speech_ts = get_speech_timestamps(audio, VAD_MODEL, sampling_rate=sr)
+
+    if not speech_ts:
+        return audio
+
+    voiced = []
+    for ts in speech_ts:
+        voiced.append(audio[ts["start"]:ts["end"]])
+
+    return np.concatenate(voiced)
 
 
-def upload_json_to_gcs(data: dict, object_name: str):
-    bucket = gcs_client.bucket(GCS_OUTPUT_BUCKET)
-    blob = bucket.blob(object_name)
-    blob.upload_from_string(
-        json.dumps(data, indent=2),
-        content_type="application/json",
-    )
+def chunk_audio(audio: np.ndarray, sr: int, chunk_sec: int = CHUNK_SEC):
+    """
+    Splits audio into <=60s chunks.
+    Matches RunPod chunking behavior.
+    """
+    samples = chunk_sec * sr
+    return [
+        audio[i:i + samples]
+        for i in range(0, len(audio), samples)
+    ]
 
 
 # =====================================================
-# CORE WHISPER PIPELINE (REUSED)
+# NEW: RUNPOD-STYLE WHISPER PIPELINE
 # =====================================================
 def run_whisper_pipeline(audio_path: str, source_name: str):
-    response = {}
-    start_wall = time.time()
+    start = time.time()
 
-    # Load audio
-    audio = whisper.load_audio(audio_path)
-    audio_duration = len(audio) / whisper.audio.SAMPLE_RATE
-    response["audio_duration_sec"] = round(audio_duration, 2)
+    # -----------------------------
+    # Load raw audio
+    # -----------------------------
+    audio, sr = sf.read(audio_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
 
-    # Pad / trim
-    audio = whisper.pad_or_trim(audio)
+    original_duration = len(audio) / sr
 
-    # Mel features
-    mel = whisper.log_mel_spectrogram(
-        audio, n_mels=NUM_MELS
-    ).to(MODEL.device)
+    # -----------------------------
+    # VAD (biggest speed win)
+    # -----------------------------
+    vad_start = time.time()
+    audio = apply_vad(audio, sr)
+    vad_time = time.time() - vad_start
 
-    # Inference
-    s = time.time()
-    result = whisper.decode(MODEL, mel)
-    inference_time = time.time() - s
+    # -----------------------------
+    # Chunking
+    # -----------------------------
+    chunks = chunk_audio(audio, sr)
 
-    throughput = audio_duration / inference_time if inference_time > 0 else 0
+    log(f"Audio {original_duration:.2f}s → {len(chunks)} chunks after VAD")
 
-    response.update({
+    texts = []
+    infer_time = 0.0
+
+    # -----------------------------
+    # Whisper per chunk
+    # -----------------------------
+    for i, chunk in enumerate(chunks, 1):
+        log(f"Processing chunk {i}/{len(chunks)}")
+
+        mel = whisper.log_mel_spectrogram(chunk, n_mels=NUM_MELS).to(MODEL.device)
+
+        s = time.time()
+        out = whisper.decode(MODEL, mel)
+        infer_time += time.time() - s
+
+        texts.append(out.text)
+
+    total_time = time.time() - start
+    throughput = original_duration / infer_time if infer_time > 0 else 0
+
+    result = {
         "source": source_name,
-        "text": result.text,
-        "language": result.language,
         "model": MODEL_VERSION,
         "device": str(MODEL.device),
-        "inference_time_sec": round(inference_time, 3),
-        "throughput_audio_sec_per_sec": round(throughput, 2),
-        "wall_time_total_sec": round(time.time() - start_wall, 2),
-    })
+        "audio_duration_sec": round(original_duration, 2),
+        "chunks": len(chunks),
+        "vad_time_sec": round(vad_time, 2),
+        "inference_time_sec": round(infer_time, 2),
+        "throughput_x_real_time": round(throughput, 2),
+        "total_wall_time_sec": round(total_time, 2),
+        "text": " ".join(texts),
+    }
 
-    # Upload output
-    object_name = (
+    # -----------------------------
+    # Upload result to GCS
+    # -----------------------------
+    out_name = (
         f"{GCS_OUTPUT_PREFIX}/"
         f"{datetime.utcnow().strftime('%Y/%m/%d')}/"
-        f"{os.path.basename(source_name)}_{int(start_wall)}.json"
+        f"{os.path.basename(source_name)}.json"
     )
 
-    upload_json_to_gcs(response, object_name)
+    blob = gcs_client.bucket(GCS_OUTPUT_BUCKET).blob(out_name)
+    blob.upload_from_string(json.dumps(result, indent=2), content_type="application/json")
 
-    log(
-        f"Processed {source_name} | "
-        f"Inference {inference_time:.2f}s | "
-        f"Throughput {throughput:.2f}x | "
-        f"Output gs://{GCS_OUTPUT_BUCKET}/{object_name}"
-    )
+    log(f"Uploaded result to gs://{GCS_OUTPUT_BUCKET}/{out_name}")
 
-    return response
+    return result
 
 
 # =====================================================
-# HEALTH CHECKS
-# =====================================================
-@app.post("/check-gpu/")
-async def check_gpu():
-    if not torch.cuda.is_available():
-        raise HTTPException(status_code=400, detail="CUDA is not available")
-    return {"cuda": True}
-
-
-@app.post("/check-ffmpeg/")
-async def check_ffmpeg():
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="FFMPEG is not available")
-    return {"ffmpeg": True}
-
-
-@app.post("/check-model-in-memory/")
-async def check_model_in_memory():
-    return {"contents": os.listdir("/app/models/")}
-
-
-# =====================================================
-# HTTP API (MANUAL UPLOAD)
-# =====================================================
-@app.post("/translate/")
-async def translate(file: UploadFile = File(...)):
-    temp_path = save_upload_file_to_temp(file)
-    try:
-        return run_whisper_pipeline(temp_path, file.filename)
-    finally:
-        os.remove(temp_path)
-
-
-# =====================================================
-# GCS EVENTARC TRIGGER
+# GCS EVENTARC HANDLER
 # =====================================================
 @app.post("/gcs-trigger")
 async def gcs_trigger(request: Request):
     event = await request.json()
 
-    # --------------------------------------------------
-    # Support BOTH CloudEvents and legacy GCS payloads
-    # --------------------------------------------------
-    if "data" in event:
-        # CloudEvents format
-        payload = event.get("data", {})
-    else:
-        # Legacy GCS notification format
-        payload = event
+    # Support both CloudEvents + legacy GCS payloads
+    payload = event.get("data", event)
 
-    bucket_name = payload.get("bucket")
-    object_name = payload.get("name")
+    bucket = payload.get("bucket")
+    name = payload.get("name")
 
-    # Defensive guard
-    if not bucket_name or not object_name:
-        log(f"Ignoring invalid GCS event payload: {event}")
-        return {"status": "ignored", "reason": "invalid payload"}
+    if not bucket or not name:
+        log(f"Ignoring invalid event: {event}")
+        return {"status": "ignored"}
 
-    log(f"GCS object finalized: gs://{bucket_name}/{object_name}")
+    if bucket != GCS_INPUT_BUCKET:
+        log(f"Ignoring event from bucket {bucket}")
+        return {"status": "ignored"}
 
-    # Bucket allow-list
-    expected_bucket = os.environ.get("GCS_INPUT_BUCKET")
-    if bucket_name != expected_bucket:
-        log(f"Ignoring event from unexpected bucket: {bucket_name}")
-        return {"status": "ignored", "reason": "unexpected bucket"}
-
-    # Ignore non-audio files
-    if not object_name.lower().endswith((".mp3", ".wav", ".m4a", ".flac")):
-        log(f"Ignoring non-audio object: {object_name}")
-        return {"status": "ignored", "reason": "non-audio"}
+    if not name.lower().endswith((".mp3", ".wav", ".m4a", ".flac")):
+        log(f"Ignoring non-audio file {name}")
+        return {"status": "ignored"}
 
     # Download file
     with tempfile.NamedTemporaryFile(delete=False) as f:
         temp_audio = f.name
 
-    gcs_client.bucket(bucket_name).blob(object_name).download_to_filename(temp_audio)
+    gcs_client.bucket(bucket).blob(name).download_to_filename(temp_audio)
 
     try:
-        run_whisper_pipeline(temp_audio, object_name)
+        run_whisper_pipeline(temp_audio, name)
     finally:
         os.remove(temp_audio)
 
-    return {"status": "processed", "file": object_name}
+    return {"status": "processed", "file": name}
