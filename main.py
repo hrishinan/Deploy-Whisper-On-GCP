@@ -91,16 +91,15 @@ def run_whisper_pipeline(audio_path: str, source_name: str):
     start = time.time()
 
     # -----------------------------
-    # Load raw audio
+    # FIX: Use FFmpeg-based decoder
     # -----------------------------
-    audio, sr = sf.read(audio_path)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+    audio = whisper.load_audio(audio_path)
+    sr = whisper.audio.SAMPLE_RATE
 
     original_duration = len(audio) / sr
 
     # -----------------------------
-    # VAD (biggest speed win)
+    # VAD
     # -----------------------------
     vad_start = time.time()
     audio = apply_vad(audio, sr)
@@ -116,9 +115,6 @@ def run_whisper_pipeline(audio_path: str, source_name: str):
     texts = []
     infer_time = 0.0
 
-    # -----------------------------
-    # Whisper per chunk
-    # -----------------------------
     for i, chunk in enumerate(chunks, 1):
         log(f"Processing chunk {i}/{len(chunks)}")
 
@@ -135,8 +131,6 @@ def run_whisper_pipeline(audio_path: str, source_name: str):
 
     result = {
         "source": source_name,
-        "model": MODEL_VERSION,
-        "device": str(MODEL.device),
         "audio_duration_sec": round(original_duration, 2),
         "chunks": len(chunks),
         "vad_time_sec": round(vad_time, 2),
