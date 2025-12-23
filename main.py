@@ -161,19 +161,29 @@ async def translate(file: UploadFile = File(...)):
 async def gcs_trigger(request: Request):
     event = await request.json()
 
-    data = event.get("data") or {}
-    bucket_name = data.get("bucket")
-    object_name = data.get("name")
+    # --------------------------------------------------
+    # Support BOTH CloudEvents and legacy GCS payloads
+    # --------------------------------------------------
+    if "data" in event:
+        # CloudEvents format
+        payload = event.get("data", {})
+    else:
+        # Legacy GCS notification format
+        payload = event
 
-    # Defensive guard — REQUIRED
+    bucket_name = payload.get("bucket")
+    object_name = payload.get("name")
+
+    # Defensive guard
     if not bucket_name or not object_name:
-        log(f"Ignoring malformed CloudEvent: {event}")
-        return {"status": "ignored", "reason": "missing bucket or object name"}
+        log(f"Ignoring invalid GCS event payload: {event}")
+        return {"status": "ignored", "reason": "invalid payload"}
 
-    log(f"GCS event received: gs://{bucket_name}/{object_name}")
+    log(f"GCS object finalized: gs://{bucket_name}/{object_name}")
 
-    # Bucket allow-list safety
-    if bucket_name != os.environ.get("GCS_INPUT_BUCKET"):
+    # Bucket allow-list
+    expected_bucket = os.environ.get("GCS_INPUT_BUCKET")
+    if bucket_name != expected_bucket:
         log(f"Ignoring event from unexpected bucket: {bucket_name}")
         return {"status": "ignored", "reason": "unexpected bucket"}
 
@@ -182,7 +192,7 @@ async def gcs_trigger(request: Request):
         log(f"Ignoring non-audio object: {object_name}")
         return {"status": "ignored", "reason": "non-audio"}
 
-    # Download the file
+    # Download file
     with tempfile.NamedTemporaryFile(delete=False) as f:
         temp_audio = f.name
 
