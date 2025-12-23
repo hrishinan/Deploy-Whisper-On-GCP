@@ -6,6 +6,5 @@ torch
 numpy<2
 tiktoken==0.6.0
 google-cloud-storage
-soundfile
 ffmpeg-python
 silero-vad
