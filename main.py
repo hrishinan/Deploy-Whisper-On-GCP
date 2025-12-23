@@ -4,46 +4,36 @@ import json
 import tempfile
 from datetime import datetime
 
-import numpy as np
-import soundfile as sf
 import torch
 import whisper
+import numpy as np
 
 from fastapi import FastAPI, Request
 from google.cloud import storage
-
-# ================================
-# NEW: VAD imports (RunPod parity)
-# ================================
 from silero_vad import load_silero_vad, get_speech_timestamps
-
 
 # =====================================================
 # CONFIG
 # =====================================================
 MODEL_VERSION = "large-v3-turbo"
 NUM_MELS = 128
-CHUNK_SEC = 60  # RunPod uses ~60s chunks
 
 GCS_INPUT_BUCKET = os.environ["GCS_INPUT_BUCKET"]
 GCS_OUTPUT_BUCKET = os.environ["GCS_OUTPUT_BUCKET"]
 GCS_OUTPUT_PREFIX = os.environ.get("GCS_OUTPUT_PREFIX", "whisper-results")
 
+USE_VAD = os.getenv("USE_VAD", "false").lower() == "true"
+
 # =====================================================
-# APP + MODELS
+# APP + MODEL
 # =====================================================
 app = FastAPI()
 
 MODEL_PATH = f"/app/models/{MODEL_VERSION}.pt"
 MODEL = whisper.load_model(MODEL_PATH)
 
-# ================================
-# NEW: Load VAD once (global)
-# ================================
-VAD_MODEL = load_silero_vad()
-
 gcs_client = storage.Client()
-
+VAD_MODEL = load_silero_vad()
 
 # =====================================================
 # LOGGING
@@ -51,98 +41,87 @@ gcs_client = storage.Client()
 def log(msg: str):
     print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
-
 # =====================================================
-# NEW: VAD + CHUNKING HELPERS
+# OPTIONAL HELPERS (NO BEHAVIOUR CHANGE)
 # =====================================================
 def apply_vad(audio: np.ndarray, sr: int) -> np.ndarray:
-    """
-    Removes silence using Silero VAD.
-    Matches RunPod: 'VAD filter removed XX sec'
-    """
     speech_ts = get_speech_timestamps(audio, VAD_MODEL, sampling_rate=sr)
-
     if not speech_ts:
         return audio
+    return np.concatenate([audio[t["start"]:t["end"]] for t in speech_ts])
 
-    voiced = []
-    for ts in speech_ts:
-        voiced.append(audio[ts["start"]:ts["end"]])
-
-    return np.concatenate(voiced)
-
-
-def chunk_audio(audio: np.ndarray, sr: int, chunk_sec: int = CHUNK_SEC):
-    """
-    Splits audio into <=60s chunks.
-    Matches RunPod chunking behavior.
-    """
+def chunk_audio(audio: np.ndarray, sr: int, chunk_sec: int = 60):
     samples = chunk_sec * sr
-    return [
-        audio[i:i + samples]
-        for i in range(0, len(audio), samples)
-    ]
-
+    return [audio[i:i + samples] for i in range(0, len(audio), samples)]
 
 # =====================================================
-# NEW: RUNPOD-STYLE WHISPER PIPELINE
+# CORE WHISPER PIPELINE (BEHAVIOUR SAFE)
 # =====================================================
-def run_whisper_pipeline(audio_path: str, source_name: str):
-    start = time.time()
+def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float):
+    pipeline_start = time.time()
+
+    log(f"[PIPELINE START] file={source_name} size={file_size_mb:.2f}MB")
 
     # -----------------------------
-    # FIX: Use FFmpeg-based decoder
+    # Decode audio (FFmpeg)
     # -----------------------------
+    decode_start = time.time()
     audio = whisper.load_audio(audio_path)
     sr = whisper.audio.SAMPLE_RATE
+    decode_time = time.time() - decode_start
 
-    original_duration = len(audio) / sr
-
-    # -----------------------------
-    # VAD
-    # -----------------------------
-    vad_start = time.time()
-    audio = apply_vad(audio, sr)
-    vad_time = time.time() - vad_start
+    duration_sec = len(audio) / sr
+    log(f"[AUDIO DECODED] duration={duration_sec:.2f}s decode_time={decode_time:.2f}s")
 
     # -----------------------------
-    # Chunking
+    # Optional VAD (off by default)
     # -----------------------------
-    chunks = chunk_audio(audio, sr)
+    if USE_VAD:
+        vad_start = time.time()
+        audio = apply_vad(audio, sr)
+        log(f"[VAD DONE] time={time.time() - vad_start:.2f}s")
 
-    log(f"Audio {original_duration:.2f}s → {len(chunks)} chunks after VAD")
+        chunks = chunk_audio(audio, sr)
+    else:
+        chunks = [audio]
 
+    log(f"[CHUNKING] chunks={len(chunks)}")
+
+    # -----------------------------
+    # Whisper inference
+    # -----------------------------
+    infer_start = time.time()
     texts = []
-    infer_time = 0.0
 
-    for i, chunk in enumerate(chunks, 1):
-        log(f"Processing chunk {i}/{len(chunks)}")
-
+    for idx, chunk in enumerate(chunks, 1):
+        log(f"[INFER] chunk={idx}/{len(chunks)} start")
         mel = whisper.log_mel_spectrogram(chunk, n_mels=NUM_MELS).to(MODEL.device)
-
-        s = time.time()
         out = whisper.decode(MODEL, mel)
-        infer_time += time.time() - s
-
         texts.append(out.text)
 
-    total_time = time.time() - start
-    throughput = original_duration / infer_time if infer_time > 0 else 0
+    inference_time = time.time() - infer_start
+    log(f"[INFERENCE DONE] time={inference_time:.2f}s")
+
+    # -----------------------------
+    # Final result
+    # -----------------------------
+    total_time = time.time() - pipeline_start
 
     result = {
-        "source": source_name,
-        "audio_duration_sec": round(original_duration, 2),
+        "input_audio": source_name,
+        "file_size_mb": round(file_size_mb, 2),
+        "duration_sec": round(duration_sec, 2),
         "chunks": len(chunks),
-        "vad_time_sec": round(vad_time, 2),
-        "inference_time_sec": round(infer_time, 2),
-        "throughput_x_real_time": round(throughput, 2),
-        "total_wall_time_sec": round(total_time, 2),
+        "inference_time_sec": round(inference_time, 2),
+        "total_completion_time_sec": round(total_time, 2),
         "text": " ".join(texts),
     }
 
     # -----------------------------
-    # Upload result to GCS
+    # Upload result
     # -----------------------------
+    upload_start = time.time()
+
     out_name = (
         f"{GCS_OUTPUT_PREFIX}/"
         f"{datetime.utcnow().strftime('%Y/%m/%d')}/"
@@ -152,45 +131,63 @@ def run_whisper_pipeline(audio_path: str, source_name: str):
     blob = gcs_client.bucket(GCS_OUTPUT_BUCKET).blob(out_name)
     blob.upload_from_string(json.dumps(result, indent=2), content_type="application/json")
 
-    log(f"Uploaded result to gs://{GCS_OUTPUT_BUCKET}/{out_name}")
+    upload_time = time.time() - upload_start
+    log(f"[UPLOAD DONE] gs://{GCS_OUTPUT_BUCKET}/{out_name} upload_time={upload_time:.2f}s")
+
+    log(
+        f"[PIPELINE COMPLETE] "
+        f"file={source_name} "
+        f"size={file_size_mb:.2f}MB "
+        f"duration={duration_sec:.2f}s "
+        f"total_time={total_time:.2f}s"
+    )
 
     return result
 
-
 # =====================================================
-# GCS EVENTARC HANDLER
+# EVENTARC GCS TRIGGER
 # =====================================================
 @app.post("/gcs-trigger")
 async def gcs_trigger(request: Request):
     event = await request.json()
-
-    # Support both CloudEvents + legacy GCS payloads
     payload = event.get("data", event)
 
     bucket = payload.get("bucket")
     name = payload.get("name")
+    generation = payload.get("generation")
+    size_bytes = int(payload.get("size", 0))
+    file_size_mb = size_bytes / (1024 * 1024)
 
-    if not bucket or not name:
-        log(f"Ignoring invalid event: {event}")
+    log(f"[EVENT RECEIVED] bucket={bucket} object={name} generation={generation}")
+
+    if not bucket or not name or not generation:
+        log("[EVENT IGNORED] invalid payload")
         return {"status": "ignored"}
 
     if bucket != GCS_INPUT_BUCKET:
-        log(f"Ignoring event from bucket {bucket}")
+        log(f"[EVENT IGNORED] unexpected bucket {bucket}")
         return {"status": "ignored"}
 
     if not name.lower().endswith((".mp3", ".wav", ".m4a", ".flac")):
-        log(f"Ignoring non-audio file {name}")
+        log(f"[EVENT IGNORED] non-audio file {name}")
         return {"status": "ignored"}
 
-    # Download file
+    # -----------------------------
+    # Download exact generation
+    # -----------------------------
+    download_start = time.time()
     with tempfile.NamedTemporaryFile(delete=False) as f:
         temp_audio = f.name
 
-    gcs_client.bucket(bucket).blob(name).download_to_filename(temp_audio)
+    blob = gcs_client.bucket(bucket).blob(name, generation=generation)
+    blob.download_to_filename(temp_audio)
+
+    log(f"[DOWNLOAD DONE] time={time.time() - download_start:.2f}s")
 
     try:
-        run_whisper_pipeline(temp_audio, name)
+        run_whisper_pipeline(temp_audio, name, file_size_mb)
     finally:
         os.remove(temp_audio)
+        log("[TEMP FILE CLEANED]")
 
     return {"status": "processed", "file": name}
