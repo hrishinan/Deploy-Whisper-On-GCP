@@ -12,7 +12,7 @@ from google.cloud import storage
 from google.api_core.exceptions import NotFound
 
 # =====================================================
-# CONFIG
+# CONFIG (unchanged semantics)
 # =====================================================
 MODEL_VERSION = "large-v3-turbo"
 NUM_MELS = 128
@@ -22,7 +22,7 @@ GCS_OUTPUT_BUCKET = os.environ["GCS_OUTPUT_BUCKET"]
 GCS_OUTPUT_PREFIX = os.environ.get("GCS_OUTPUT_PREFIX", "whisper-results")
 
 # =====================================================
-# APP + MODEL
+# APP + MODEL (unchanged)
 # =====================================================
 app = FastAPI()
 
@@ -43,42 +43,45 @@ def log(msg: str):
 def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float):
     pipeline_start = time.time()
 
-    log(f"[PIPELINE START]")
+    log("========== PIPELINE START ==========")
     log(f"Input Audio Sample : {source_name}")
     log(f"File Size (MB)     : {file_size_mb:.2f}")
 
     # -------------------------------------------------
-    # Decode audio (ORIGINAL PATH – FFmpeg via Whisper)
+    # Decode audio (FFmpeg via Whisper – ORIGINAL PATH)
     # -------------------------------------------------
     decode_start = time.time()
     audio = whisper.load_audio(audio_path)
-    sr = whisper.audio.SAMPLE_RATE
     decode_time = time.time() - decode_start
 
-    duration_sec = len(audio) / sr
+    # IMPORTANT: capture real duration BEFORE padding
+    original_duration_sec = len(audio) / whisper.audio.SAMPLE_RATE
 
-    log(f"Audio Duration (s) : {duration_sec:.2f}")
-    log(f"Decode Time (s)    : {decode_time:.2f}")
+    # REQUIRED Whisper invariant (original behavior)
+    audio = whisper.pad_or_trim(audio)
+
+    log(f"Original Duration (s) : {original_duration_sec:.2f}")
+    log(f"Decode Time (s)       : {decode_time:.2f}")
 
     # -------------------------------------------------
-    # ORIGINAL SINGLE-PASS WHISPER INFERENCE
+    # SINGLE-PASS WHISPER INFERENCE (UNCHANGED)
     # -------------------------------------------------
     infer_start = time.time()
     mel = whisper.log_mel_spectrogram(audio, n_mels=NUM_MELS).to(MODEL.device)
     result = whisper.decode(MODEL, mel)
     inference_time = time.time() - infer_start
 
-    log(f"Inference Time (s) : {inference_time:.2f}")
+    log(f"Inference Time (s)    : {inference_time:.2f}")
 
     total_time = time.time() - pipeline_start
 
     # -------------------------------------------------
-    # Build result JSON (unchanged semantics)
+    # Build output JSON (same semantics)
     # -------------------------------------------------
     output = {
         "input_audio": source_name,
         "file_size_mb": round(file_size_mb, 2),
-        "duration_sec": round(duration_sec, 2),
+        "duration_sec": round(original_duration_sec, 2),
         "inference_time_sec": round(inference_time, 2),
         "total_completion_time_sec": round(total_time, 2),
         "text": result.text,
@@ -104,10 +107,10 @@ def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float)
 
     upload_time = time.time() - upload_start
 
-    log(f"Output Uploaded    : gs://{GCS_OUTPUT_BUCKET}/{out_name}")
-    log(f"Upload Time (s)    : {upload_time:.2f}")
-    log(f"Total Completion  : {total_time:.2f}s")
-    log(f"[PIPELINE COMPLETE]")
+    log(f"Output Path           : gs://{GCS_OUTPUT_BUCKET}/{out_name}")
+    log(f"Upload Time (s)       : {upload_time:.2f}")
+    log(f"Total Completion (s)  : {total_time:.2f}")
+    log("========== PIPELINE END ==========")
 
     return output
 
@@ -126,17 +129,20 @@ async def gcs_trigger(request: Request):
     generation = payload.get("generation")
     size_bytes = int(payload.get("size", 0))
 
-    # Normalize object name (NO behavior change, correctness only)
+    # Normalize object name (correctness only)
     name = urllib.parse.unquote(html.unescape(raw_name)) if raw_name else None
     file_size_mb = size_bytes / (1024 * 1024)
 
-    log(f"[EVENT RECEIVED]")
-    log(f"Bucket             : {bucket}")
-    log(f"Raw Object Name    : {raw_name}")
-    log(f"Decoded Name       : {name}")
-    log(f"Generation         : {generation}")
-    log(f"Reported Size (MB) : {file_size_mb:.2f}")
+    log("========== EVENT RECEIVED ==========")
+    log(f"Bucket              : {bucket}")
+    log(f"Raw Object Name     : {raw_name}")
+    log(f"Decoded Object Name : {name}")
+    log(f"Generation          : {generation}")
+    log(f"Reported Size (MB)  : {file_size_mb:.2f}")
 
+    # -------------------------------------------------
+    # Defensive guards (no behavior change)
+    # -------------------------------------------------
     if not bucket or not name or not generation:
         log("[EVENT IGNORED] Missing required fields")
         return {"status": "ignored"}
@@ -150,7 +156,7 @@ async def gcs_trigger(request: Request):
         return {"status": "ignored"}
 
     # -------------------------------------------------
-    # Download exact object generation
+    # Download EXACT object generation
     # -------------------------------------------------
     download_start = time.time()
 
@@ -163,22 +169,28 @@ async def gcs_trigger(request: Request):
         blob.download_to_filename(temp_audio)
     except NotFound:
         log(
-            f"[SKIPPED] Object no longer exists "
+            "[SKIPPED] Object no longer exists "
             f"(bucket={bucket}, name={name}, generation={generation})"
         )
         return {"status": "skipped", "reason": "object_not_found"}
 
     download_time = time.time() - download_start
 
-    log(f"Download Time (s)  : {download_time:.2f}")
-    log(f"Temp File Path    : {temp_audio}")
+    log(f"Download Time (s)    : {download_time:.2f}")
+    log(f"Temp File Path      : {temp_audio}")
 
+    # -------------------------------------------------
+    # Run Whisper pipeline
+    # -------------------------------------------------
     try:
         run_whisper_pipeline(temp_audio, name, file_size_mb)
     finally:
         os.remove(temp_audio)
         log("Temp File Cleaned")
 
-    log(f"[EVENT COMPLETE] Total Event Time: {time.time() - event_start:.2f}s")
+    log(
+        f"[EVENT COMPLETE] Total Event Time (s): "
+        f"{time.time() - event_start:.2f}"
+    )
 
     return {"status": "processed", "file": name}
