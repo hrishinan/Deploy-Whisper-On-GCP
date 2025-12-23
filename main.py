@@ -160,20 +160,29 @@ async def translate(file: UploadFile = File(...)):
 @app.post("/gcs-trigger")
 async def gcs_trigger(request: Request):
     event = await request.json()
-    data = event.get("data", {})
 
+    data = event.get("data") or {}
     bucket_name = data.get("bucket")
     object_name = data.get("name")
-    size = data.get("size")
 
-    log(f"GCS event: gs://{bucket_name}/{object_name} ({size} bytes)")
+    # Defensive guard — REQUIRED
+    if not bucket_name or not object_name:
+        log(f"Ignoring malformed CloudEvent: {event}")
+        return {"status": "ignored", "reason": "missing bucket or object name"}
 
-    # Skip non-audio files
+    log(f"GCS event received: gs://{bucket_name}/{object_name}")
+
+    # Bucket allow-list safety
+    if bucket_name != os.environ.get("GCS_INPUT_BUCKET"):
+        log(f"Ignoring event from unexpected bucket: {bucket_name}")
+        return {"status": "ignored", "reason": "unexpected bucket"}
+
+    # Ignore non-audio files
     if not object_name.lower().endswith((".mp3", ".wav", ".m4a", ".flac")):
-        log("Ignored non-audio file")
-        return {"status": "ignored"}
+        log(f"Ignoring non-audio object: {object_name}")
+        return {"status": "ignored", "reason": "non-audio"}
 
-    # Download file
+    # Download the file
     with tempfile.NamedTemporaryFile(delete=False) as f:
         temp_audio = f.name
 
