@@ -101,12 +101,20 @@ jobs:
         run: |
           docker push asia-southeast1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/kokila-v0/github:latest
 
-      - name: Deploy to Cloud Run
+      - name: Deploy to Cloud Run (GPU)
         run: |
           gcloud run deploy kokila \
               --image asia-southeast1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/kokila-v0/github:latest \
               --region asia-southeast1 \
-              --allow-unauthenticated \
               --memory 16Gi \
               --cpu 4 \
-              --timeout 900
+              --gpu 1 \
+              --gpu-type nvidia-l4 \
+              --concurrency 1 \
+              --timeout 900 \
+              --max-instances 3 \
+              --set-env-vars \
+                GCS_INPUT_BUCKET=kokila-input,\
+                GCS_OUTPUT_BUCKET=kokila-output,\
+                GCS_OUTPUT_PREFIX=whisper-results \
+              --no-allow-unauthenticated
