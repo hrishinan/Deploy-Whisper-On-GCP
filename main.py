@@ -11,15 +11,21 @@ from fastapi import FastAPI, Request
 from google.cloud import storage
 from google.api_core.exceptions import NotFound
 
+
 # =====================================================
 # CONFIG
 # =====================================================
 MODEL_VERSION = "large-v3-turbo"
-NUM_MELS = 128
 
+# Buckets
 GCS_INPUT_BUCKET = os.environ["GCS_INPUT_BUCKET"]
 GCS_OUTPUT_BUCKET = os.environ["GCS_OUTPUT_BUCKET"]
 GCS_OUTPUT_PREFIX = os.environ.get("GCS_OUTPUT_PREFIX", "whisper-results")
+
+# Task mode:
+#   "transcribe" → original language
+#   "translate"  → force English output
+WHISPER_TASK = os.environ.get("WHISPER_TASK", "translate")
 
 # =====================================================
 # APP + MODEL
@@ -31,93 +37,93 @@ MODEL = whisper.load_model(MODEL_PATH)
 
 gcs_client = storage.Client()
 
+
 # =====================================================
 # LOGGING
 # =====================================================
 def log(msg: str):
     print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
+
 # =====================================================
-# CORE WHISPER PIPELINE
-# (MATCHES ORIGINAL GITHUB BEHAVIOR)
+# CORE WHISPER PIPELINE (FULL AUDIO SAFE)
 # =====================================================
 def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float):
     pipeline_start = time.time()
-    timings = {}
 
     log("========== PIPELINE START ==========")
-    log(f"Input Audio            : {source_name}")
-    log(f"File Size (MB)         : {file_size_mb:.2f}")
+    log(f"Input Audio              : {source_name}")
+    log(f"File Size (MB)           : {file_size_mb:.2f}")
+    log(f"Whisper Task             : {WHISPER_TASK}")
 
     # -------------------------------------------------
-    # Load audio
+    # Load audio ONLY for duration measurement
     # -------------------------------------------------
     t0 = time.time()
     audio = whisper.load_audio(audio_path)
-    timings["load_audio_sec"] = time.time() - t0
+    load_audio_time = time.time() - t0
 
     duration_sec = len(audio) / whisper.audio.SAMPLE_RATE
-    log(f"Original Duration (s)  : {duration_sec:.2f}")
-    log(f"Load Audio Time (s)    : {timings['load_audio_sec']:.2f}")
+
+    log(f"Load Audio Time (s)      : {load_audio_time:.2f}")
+    log(f"Audio Duration (s)       : {duration_sec:.2f}")
 
     # -------------------------------------------------
-    # Pad / Trim (REQUIRED BY ORIGINAL CODE)
+    # FULL WHISPER TRANSCRIPTION (NO TRUNCATION)
     # -------------------------------------------------
-    t0 = time.time()
-    audio = whisper.pad_or_trim(audio)
-    timings["pad_trim_sec"] = time.time() - t0
-    log(f"Pad/Trim Time (s)      : {timings['pad_trim_sec']:.2f}")
+    log("Starting Whisper full-audio transcription")
 
-    # -------------------------------------------------
-    # Compute MEL features (EXPLICIT)
-    # -------------------------------------------------
-    t0 = time.time()
-    mel = whisper.log_mel_spectrogram(
-        audio, n_mels=NUM_MELS
-    ).to(MODEL.device)
-    timings["mel_compute_sec"] = time.time() - t0
-    log(f"Mel Compute Time (s)   : {timings['mel_compute_sec']:.2f}")
+    infer_start = time.time()
 
-    # -------------------------------------------------
-    # Decode (FORCED TRANSLATION — ORIGINAL BEHAVIOR)
-    # -------------------------------------------------
-    log("Starting Whisper decode (translate → English)")
-
-    decode_options = whisper.DecodingOptions(
-        task="translate",
-        language="en",
-        fp16=True
+    result = MODEL.transcribe(
+        audio_path,
+        task=WHISPER_TASK,     # "transcribe" or "translate"
+        language=None,         # auto-detect
+        fp16=True,
+        verbose=False
     )
 
-    t0 = time.time()
-    result = whisper.decode(MODEL, mel, decode_options)
-    timings["decode_sec"] = time.time() - t0
+    inference_time = time.time() - infer_start
 
-    log(f"Decode Time (s)        : {timings['decode_sec']:.2f}")
-    log(f"Detected Language      : {result.language}")
+    # -------------------------------------------------
+    # Extract results
+    # -------------------------------------------------
+    text = result.get("text", "").strip()
+    language = result.get("language", "unknown")
+    segments = result.get("segments", [])
+
+    log(f"Inference Time (s)      : {inference_time:.2f}")
+    log(f"Detected Language       : {language}")
+    log(f"Segments Produced       : {len(segments)}")
+
+    if segments:
+        log(
+            f"Segment Coverage (s)    : "
+            f"{segments[-1]['end']:.2f} / {duration_sec:.2f}"
+        )
 
     total_time = time.time() - pipeline_start
 
     # -------------------------------------------------
-    # Build output JSON (summary-friendly)
+    # Build output JSON (rich + auditable)
     # -------------------------------------------------
     output = {
         "input_audio": source_name,
         "file_size_mb": round(file_size_mb, 2),
         "duration_sec": round(duration_sec, 2),
-        "language_detected": result.language,
-        "text": result.text.strip(),
+        "language_detected": language,
+        "task": WHISPER_TASK,
+        "segment_count": len(segments),
+        "text": text,
         "timings": {
-            "load_audio_sec": round(timings["load_audio_sec"], 2),
-            "pad_trim_sec": round(timings["pad_trim_sec"], 2),
-            "mel_compute_sec": round(timings["mel_compute_sec"], 2),
-            "decode_sec": round(timings["decode_sec"], 2),
+            "load_audio_sec": round(load_audio_time, 2),
+            "inference_sec": round(inference_time, 2),
             "total_pipeline_sec": round(total_time, 2),
         }
     }
 
     # -------------------------------------------------
-    # Upload JSON to GCS
+    # Upload result to GCS
     # -------------------------------------------------
     upload_start = time.time()
 
@@ -129,18 +135,19 @@ def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float)
 
     blob = gcs_client.bucket(GCS_OUTPUT_BUCKET).blob(out_name)
     blob.upload_from_string(
-        json.dumps(output, indent=2),
+        json.dumps(output, indent=2, ensure_ascii=False),
         content_type="application/json"
     )
 
     upload_time = time.time() - upload_start
 
-    log(f"Output Path            : gs://{GCS_OUTPUT_BUCKET}/{out_name}")
-    log(f"Upload Time (s)        : {upload_time:.2f}")
-    log(f"Total Pipeline (s)     : {total_time:.2f}")
+    log(f"Output Path             : gs://{GCS_OUTPUT_BUCKET}/{out_name}")
+    log(f"Upload Time (s)         : {upload_time:.2f}")
+    log(f"Total Completion (s)    : {total_time:.2f}")
     log("========== PIPELINE END ==========")
 
     return output
+
 
 # =====================================================
 # EVENTARC GCS TRIGGER
@@ -161,11 +168,11 @@ async def gcs_trigger(request: Request):
     file_size_mb = size_bytes / (1024 * 1024)
 
     log("========== EVENT RECEIVED ==========")
-    log(f"Bucket                 : {bucket}")
-    log(f"Raw Object Name        : {raw_name}")
-    log(f"Decoded Object Name    : {name}")
-    log(f"Generation             : {generation}")
-    log(f"Reported Size (MB)     : {file_size_mb:.2f}")
+    log(f"Bucket                  : {bucket}")
+    log(f"Raw Object Name         : {raw_name}")
+    log(f"Decoded Object Name     : {name}")
+    log(f"Generation              : {generation}")
+    log(f"Reported Size (MB)      : {file_size_mb:.2f}")
 
     # -------------------------------------------------
     # Guards
@@ -185,15 +192,15 @@ async def gcs_trigger(request: Request):
     # -------------------------------------------------
     # Download exact object generation
     # -------------------------------------------------
+    download_start = time.time()
+
     with tempfile.NamedTemporaryFile(delete=False) as f:
         temp_audio = f.name
 
     blob = gcs_client.bucket(bucket).blob(name, generation=generation)
 
     try:
-        t0 = time.time()
         blob.download_to_filename(temp_audio)
-        log(f"Download Time (s)      : {time.time() - t0:.2f}")
     except NotFound:
         log(
             "[SKIPPED] Object no longer exists "
@@ -201,10 +208,13 @@ async def gcs_trigger(request: Request):
         )
         return {"status": "skipped", "reason": "object_not_found"}
 
-    log(f"Temp File Path         : {temp_audio}")
+    download_time = time.time() - download_start
+
+    log(f"Download Time (s)       : {download_time:.2f}")
+    log(f"Temp File Path          : {temp_audio}")
 
     # -------------------------------------------------
-    # Run pipeline
+    # Run Whisper
     # -------------------------------------------------
     try:
         run_whisper_pipeline(temp_audio, name, file_size_mb)
