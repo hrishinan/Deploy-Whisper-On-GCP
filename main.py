@@ -67,6 +67,7 @@ def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float)
 
     result = MODEL.transcribe(
         audio_path,
+        task="translate",
         fp16=True,
         verbose=False
     )
@@ -165,7 +166,7 @@ async def gcs_trigger(request: Request):
         log("[EVENT IGNORED] Unexpected bucket")
         return {"status": "ignored"}
 
-    if not name.lower().endswith((".mp3", ".wav", ".m4a", ".flac")):
+    if not name.lower().endswith((".mp3", ".wav", ".m4a", ".flac", ".ogg")):
         log("[EVENT IGNORED] Not an audio file")
         return {"status": "ignored"}
 
