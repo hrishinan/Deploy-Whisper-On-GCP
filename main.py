@@ -12,17 +12,16 @@ from google.cloud import storage
 from google.api_core.exceptions import NotFound
 
 # =====================================================
-# CONFIG (unchanged semantics)
+# CONFIG
 # =====================================================
 MODEL_VERSION = "large-v3-turbo"
-NUM_MELS = 128
 
 GCS_INPUT_BUCKET = os.environ["GCS_INPUT_BUCKET"]
 GCS_OUTPUT_BUCKET = os.environ["GCS_OUTPUT_BUCKET"]
 GCS_OUTPUT_PREFIX = os.environ.get("GCS_OUTPUT_PREFIX", "whisper-results")
 
 # =====================================================
-# APP + MODEL (unchanged)
+# APP + MODEL
 # =====================================================
 app = FastAPI()
 
@@ -38,45 +37,60 @@ def log(msg: str):
     print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
 # =====================================================
-# CORE WHISPER PIPELINE (ORIGINAL BEHAVIOR)
+# CORE WHISPER PIPELINE (FULL AUDIO SAFE)
 # =====================================================
 def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float):
     pipeline_start = time.time()
 
     log("========== PIPELINE START ==========")
-    log(f"Input Audio Sample : {source_name}")
-    log(f"File Size (MB)     : {file_size_mb:.2f}")
+    log(f"Input Audio Sample      : {source_name}")
+    log(f"File Size (MB)          : {file_size_mb:.2f}")
 
     # -------------------------------------------------
-    # Decode audio (FFmpeg via Whisper – ORIGINAL PATH)
+    # Decode audio ONLY to compute true duration
     # -------------------------------------------------
     decode_start = time.time()
     audio = whisper.load_audio(audio_path)
     decode_time = time.time() - decode_start
 
-    # IMPORTANT: capture real duration BEFORE padding
     original_duration_sec = len(audio) / whisper.audio.SAMPLE_RATE
 
-    # REQUIRED Whisper invariant (original behavior)
-    audio = whisper.pad_or_trim(audio)
-
-    log(f"Original Duration (s) : {original_duration_sec:.2f}")
-    log(f"Decode Time (s)       : {decode_time:.2f}")
+    log(f"Original Duration (s)   : {original_duration_sec:.2f}")
+    log(f"Decode Time (s)         : {decode_time:.2f}")
 
     # -------------------------------------------------
-    # SINGLE-PASS WHISPER INFERENCE (UNCHANGED)
+    # FULL WHISPER TRANSCRIPTION (LONG AUDIO)
     # -------------------------------------------------
+    log("Starting full Whisper transcription")
+
     infer_start = time.time()
-    mel = whisper.log_mel_spectrogram(audio, n_mels=NUM_MELS).to(MODEL.device)
-    result = whisper.decode(MODEL, mel)
+
+    result = MODEL.transcribe(
+        audio_path,
+        fp16=True,
+        verbose=False
+    )
+
     inference_time = time.time() - infer_start
 
-    log(f"Inference Time (s)    : {inference_time:.2f}")
+    text = result.get("text", "").strip()
+    language = result.get("language", "unknown")
+    segments = result.get("segments", [])
+
+    log(f"Inference Time (s)      : {inference_time:.2f}")
+    log(f"Detected Language       : {language}")
+    log(f"Segments Produced       : {len(segments)}")
+
+    if segments:
+        log(
+            f"Segment Coverage (s)    : "
+            f"{segments[-1]['end']:.2f} / {original_duration_sec:.2f}"
+        )
 
     total_time = time.time() - pipeline_start
 
     # -------------------------------------------------
-    # Build output JSON (same semantics)
+    # Build output JSON (same richness + more clarity)
     # -------------------------------------------------
     output = {
         "input_audio": source_name,
@@ -84,8 +98,9 @@ def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float)
         "duration_sec": round(original_duration_sec, 2),
         "inference_time_sec": round(inference_time, 2),
         "total_completion_time_sec": round(total_time, 2),
-        "text": result.text,
-        "language": result.language,
+        "language": language,
+        "segment_count": len(segments),
+        "text": text,
     }
 
     # -------------------------------------------------
@@ -107,9 +122,9 @@ def run_whisper_pipeline(audio_path: str, source_name: str, file_size_mb: float)
 
     upload_time = time.time() - upload_start
 
-    log(f"Output Path           : gs://{GCS_OUTPUT_BUCKET}/{out_name}")
-    log(f"Upload Time (s)       : {upload_time:.2f}")
-    log(f"Total Completion (s)  : {total_time:.2f}")
+    log(f"Output Path             : gs://{GCS_OUTPUT_BUCKET}/{out_name}")
+    log(f"Upload Time (s)         : {upload_time:.2f}")
+    log(f"Total Completion (s)    : {total_time:.2f}")
     log("========== PIPELINE END ==========")
 
     return output
@@ -129,19 +144,18 @@ async def gcs_trigger(request: Request):
     generation = payload.get("generation")
     size_bytes = int(payload.get("size", 0))
 
-    # Normalize object name (correctness only)
     name = urllib.parse.unquote(html.unescape(raw_name)) if raw_name else None
     file_size_mb = size_bytes / (1024 * 1024)
 
     log("========== EVENT RECEIVED ==========")
-    log(f"Bucket              : {bucket}")
-    log(f"Raw Object Name     : {raw_name}")
-    log(f"Decoded Object Name : {name}")
-    log(f"Generation          : {generation}")
-    log(f"Reported Size (MB)  : {file_size_mb:.2f}")
+    log(f"Bucket                 : {bucket}")
+    log(f"Raw Object Name        : {raw_name}")
+    log(f"Decoded Object Name    : {name}")
+    log(f"Generation             : {generation}")
+    log(f"Reported Size (MB)     : {file_size_mb:.2f}")
 
     # -------------------------------------------------
-    # Defensive guards (no behavior change)
+    # Defensive guards
     # -------------------------------------------------
     if not bucket or not name or not generation:
         log("[EVENT IGNORED] Missing required fields")
@@ -176,8 +190,8 @@ async def gcs_trigger(request: Request):
 
     download_time = time.time() - download_start
 
-    log(f"Download Time (s)    : {download_time:.2f}")
-    log(f"Temp File Path      : {temp_audio}")
+    log(f"Download Time (s)      : {download_time:.2f}")
+    log(f"Temp File Path         : {temp_audio}")
 
     # -------------------------------------------------
     # Run Whisper pipeline
